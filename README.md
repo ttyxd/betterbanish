@@ -1,4 +1,6 @@
-## xbanish
+## xbanish (Fork)
+this fork aims to add a jitter option, such that the mouse has to move a certain 
+distance before appearing again.
 
 xbanish hides the mouse cursor when you start typing, and shows it again when
 the mouse cursor moves or a mouse button is pressed.
