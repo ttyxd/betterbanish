@@ -50,7 +50,7 @@ static int device_change_type = -1;
 static long last_device_change = -1;
 
 static Display *dpy;
-static int hiding = 0, legacy = 0, always_hide = 0, ignore_scroll = 0;
+static int hiding = 0, legacy = 0, always_hide = 0, ignore_scroll = 0, keystroke_count = 1, current_keystrokes = 0;
 static unsigned timeout = 0;
 static int jitter = 0;
 static int hide_x = 0, hide_y = 0;
@@ -96,10 +96,13 @@ main(int argc, char *argv[])
 		{"all", -1},
 	};
 
-	while ((ch = getopt(argc, argv, "adi:j:m:t:s")) != -1)
+	while ((ch = getopt(argc, argv, "ac:di:j:m:t:s")) != -1)
 		switch (ch) {
 		case 'a':
 			always_hide = 1;
+			break;
+		case 'c':
+			keystroke_count = strtoul(optarg, NULL, 0);
 			break;
 		case 'd':
 			debug = 1;
@@ -109,6 +112,9 @@ main(int argc, char *argv[])
 			    i < sizeof(mods) / sizeof(struct mod_lookup); i++)
 				if (strcasecmp(optarg, mods[i].name) == 0)
 					ignored |= mods[i].mask;
+
+			if (strcasecmp(optarg, "all") == 0)
+				ignored &= ~Mod2Mask;
 
 			break;
 		case 'j':
@@ -238,7 +244,11 @@ main(int argc, char *argv[])
 				}
 			}
 
-			hide_cursor();
+			if (e.type == key_release_type || e.type == KeyRelease) {
+				current_keystrokes++;
+				if (current_keystrokes >= keystroke_count)
+					hide_cursor();
+			}
 			break;
 
 		case ButtonRelease:
@@ -384,6 +394,8 @@ hide_cursor(void)
 void
 show_cursor(void)
 {
+	current_keystrokes = 0;
+
 	Window win;
 	int cur_x, cur_y, junk;
 	unsigned int ujunk;
@@ -617,7 +629,7 @@ set_alarm(XSyncAlarm *alarm, XSyncTestType test)
 void
 usage(char *progname)
 {
-	fprintf(stderr, "usage: %s [-a] [-d] [-i mod] [-j pixels] [-m [w]nw|ne|sw|se|+/-xy] "
+	fprintf(stderr, "usage: %s [-a] [-c count] [-d] [-i mod] [-j pixels] [-m [w]nw|ne|sw|se|+/-xy] "
 	    "[-t seconds] [-s]\n", progname);
 	exit(1);
 }
