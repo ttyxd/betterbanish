@@ -25,7 +25,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <linux/input.h>
-#include <sys/inotify.h>
+#include <libudev.h>
 
 #include <X11/X.h>
 #include <X11/Xlib.h>
@@ -46,6 +46,9 @@ int test_bit(int bit, unsigned long *array);
 
 
 
+int add_device(const char *);
+void remove_device(const char *);
+
 static Display *dpy;
 static int hiding = 0, always_hide = 0, ignore_scroll = 0, keystroke_count = 1, current_keystrokes = 0;
 static unsigned timeout = 0;
@@ -60,8 +63,10 @@ static int debug = 0;
 
 #define MAX_INPUT_DEVICES 16
 static int keyboard_fds[MAX_INPUT_DEVICES];
+static char *keyboard_paths[MAX_INPUT_DEVICES];
 static int num_keyboards = 0;
 static int mouse_fds[MAX_INPUT_DEVICES];
+static char *mouse_paths[MAX_INPUT_DEVICES];
 static int num_mice = 0;
 
 static int move = 0, move_x, move_y, move_custom_x, move_custom_y, move_custom_mask;
@@ -76,6 +81,117 @@ enum move_types {
 	MOVE_WIN_SE,
 	MOVE_CUSTOM,
 };
+
+int
+add_device(const char *path)
+{
+	int fd, i;
+	char name[256];
+	unsigned long ev_bits[EV_MAX / (sizeof(long) * 8) + 1];
+	unsigned long key_bits[KEY_MAX / (sizeof(long) * 8) + 1];
+
+	for (i = 0; i < num_keyboards; i++)
+		if (strcmp(keyboard_paths[i], path) == 0)
+			return 0;
+	for (i = 0; i < num_mice; i++)
+		if (strcmp(mouse_paths[i], path) == 0)
+			return 0;
+
+	if ((fd = open(path, O_RDONLY | O_NONBLOCK)) < 0) {
+		warn("add_device: can't open %s", path);
+		return 0;
+	}
+
+	if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
+		warn("add_device: can't get device name for %s", path);
+		close(fd);
+		return 0;
+	}
+	DPRINTF(("add_device: checking device %s: %s\n", path, name));
+
+	memset(ev_bits, 0, sizeof(ev_bits));
+	if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0) {
+		warn("add_device: can't get event bits for %s", path);
+		close(fd);
+		return 0;
+	}
+
+	if (test_bit(EV_KEY, ev_bits) && num_keyboards < MAX_INPUT_DEVICES) {
+		memset(key_bits, 0, sizeof(key_bits));
+		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
+			warn("add_device: can't get key bits for %s", path);
+			close(fd);
+			return 0;
+		}
+
+		if (test_bit(KEY_SPACE, key_bits)) {
+			DPRINTF(("found keyboard: %s\n", path));
+			keyboard_fds[num_keyboards] = fd;
+			keyboard_paths[num_keyboards] = strdup(path);
+			num_keyboards++;
+			return fd;
+		}
+	}
+
+	if ((test_bit(EV_REL, ev_bits) || test_bit(EV_ABS, ev_bits)) && num_mice < MAX_INPUT_DEVICES) {
+		memset(key_bits, 0, sizeof(key_bits));
+		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
+			warn("add_device: can't get key bits for %s", path);
+			close(fd);
+			return 0;
+		}
+
+		if (test_bit(BTN_MOUSE, key_bits) || test_bit(BTN_TOUCH, key_bits)) {
+			DPRINTF(("found pointer: %s\n", path));
+			mouse_fds[num_mice] = fd;
+			mouse_paths[num_mice] = strdup(path);
+			num_mice++;
+			return fd;
+		}
+	}
+
+	close(fd);
+	return 0;
+}
+
+
+void
+remove_device(const char *path)
+{
+	int i;
+
+	for (i = 0; i < num_keyboards; i++) {
+		if (keyboard_paths[i] && strcmp(keyboard_paths[i], path) == 0) {
+			DPRINTF(("removing keyboard: %s\n", path));
+			close(keyboard_fds[i]);
+			free(keyboard_paths[i]);
+			keyboard_paths[i] = NULL;
+			/* Shift remaining elements */
+			for (int j = i; j < num_keyboards - 1; j++) {
+				keyboard_fds[j] = keyboard_fds[j + 1];
+				keyboard_paths[j] = keyboard_paths[j + 1];
+			}
+			num_keyboards--;
+			return;
+		}
+	}
+
+	for (i = 0; i < num_mice; i++) {
+		if (mouse_paths[i] && strcmp(mouse_paths[i], path) == 0) {
+			DPRINTF(("removing pointer: %s\n", path));
+			close(mouse_fds[i]);
+			free(mouse_paths[i]);
+			mouse_paths[i] = NULL;
+			/* Shift remaining elements */
+			for (int j = i; j < num_mice - 1; j++) {
+				mouse_fds[j] = mouse_fds[j + 1];
+				mouse_paths[j] = mouse_paths[j + 1];
+			}
+			num_mice--;
+			return;
+		}
+	}
+}
 
 int
 main(int argc, char *argv[])
@@ -197,20 +313,27 @@ main(int argc, char *argv[])
 			errx(1, "no idle counter");
 	}
 
-	int inotify_fd;
+	struct udev *udev;
+	struct udev_monitor *mon;
+	int udev_fd;
 	fd_set fds;
 	int max_fd;
 	struct timeval tv;
 	struct input_event ev;
 
-	inotify_fd = inotify_init1(IN_NONBLOCK);
-	if (inotify_fd < 0)
-		err(1, "inotify_init1 failed");
+	udev = udev_new();
+	if (!udev)
+		errx(1, "udev_new() failed");
 
-	if (inotify_add_watch(inotify_fd, "/dev/input", IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM) < 0)
-		err(1, "inotify_add_watch failed");
+	mon = udev_monitor_new_from_netlink(udev, "udev");
+	if (!mon)
+		errx(1, "udev_monitor_new_from_netlink() failed");
 
-	max_fd = inotify_fd;
+	udev_monitor_filter_add_match_subsystem_devtype(mon, "input", NULL);
+	udev_monitor_enable_receiving(mon);
+	udev_fd = udev_monitor_get_fd(mon);
+
+	max_fd = udev_fd;
 
 	for (i = 0; i < num_keyboards; i++)
 		if (keyboard_fds[i] > max_fd)
@@ -221,7 +344,7 @@ main(int argc, char *argv[])
 
 	for (;;) {
 		FD_ZERO(&fds);
-		FD_SET(inotify_fd, &fds);
+		FD_SET(udev_fd, &fds);
 		for (i = 0; i < num_keyboards; i++)
 			FD_SET(keyboard_fds[i], &fds);
 		for (i = 0; i < num_mice; i++)
@@ -233,28 +356,36 @@ main(int argc, char *argv[])
 		if (select(max_fd + 1, &fds, NULL, NULL, &tv) == -1)
 			err(1, "select failed");
 
-		if (FD_ISSET(inotify_fd, &fds)) {
-			DPRINTF(("evdev: inotify event, re-snooping\n"));
-			/* drain the inotify fd */
-			char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
-			read(inotify_fd, buf, sizeof(buf));
+		if (FD_ISSET(udev_fd, &fds)) {
+			DPRINTF(("udev event received\n"));
+			struct udev_device *dev = udev_monitor_receive_device(mon);
+			if (dev) {
+				const char *action = udev_device_get_action(dev);
+				const char *path = udev_device_get_devnode(dev);
 
-			for (i = 0; i < num_keyboards; i++)
-				close(keyboard_fds[i]);
-			for (i = 0; i < num_mice; i++)
-				close(mouse_fds[i]);
+				if (action && path) {
+					DPRINTF(("udev action: %s for %s\n",
+					    action, path));
 
-			num_keyboards = 0;
-			num_mice = 0;
-			snoop_evdev();
+					if (strcmp(action, "add") == 0) {
+						int new_fd = add_device(path);
+						if (new_fd > max_fd)
+							max_fd = new_fd;
+					} else if (strcmp(action, "remove") == 0) {
+						remove_device(path);
 
-			max_fd = inotify_fd;
-			for (i = 0; i < num_keyboards; i++)
-				if (keyboard_fds[i] > max_fd)
-					max_fd = keyboard_fds[i];
-			for (i = 0; i < num_mice; i++)
-				if (mouse_fds[i] > max_fd)
-					max_fd = mouse_fds[i];
+						max_fd = udev_fd;
+						for (i = 0; i < num_keyboards; i++)
+							if (keyboard_fds[i] > max_fd)
+								max_fd = keyboard_fds[i];
+						for (i = 0; i < num_mice; i++)
+							if (mouse_fds[i] > max_fd)
+								max_fd = mouse_fds[i];
+					}
+				}
+
+				udev_device_unref(dev);
+			}
 		}
 
 		for (i = 0; i < num_keyboards; i++) {
@@ -426,70 +557,17 @@ snoop_evdev(void)
 	DIR *dir;
 	struct dirent *entry;
 	char path[512];
-	int fd;
-	char name[256];
-	unsigned long ev_bits[EV_MAX / (sizeof(long) * 8) + 1];
-	unsigned long key_bits[KEY_MAX / (sizeof(long) * 8) + 1];
 
 	if (!(dir = opendir("/dev/input"))) {
 		warn("can't open /dev/input");
 		return 0;
 	}
 
-	while ((entry = readdir(dir)) != NULL &&
-	    (num_keyboards < MAX_INPUT_DEVICES || num_mice < MAX_INPUT_DEVICES)) {
+	while ((entry = readdir(dir)) != NULL) {
 		if (strncmp(entry->d_name, "event", 5) == 0) {
-			snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
-			if ((fd = open(path, O_RDONLY | O_NONBLOCK)) < 0) {
-				warn("can't open %s", path);
-				continue;
-			}
-
-			if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
-				warn("can't get device name for %s", path);
-				close(fd);
-				continue;
-			}
-			DPRINTF(("checking device %s: %s\n", path, name));
-
-			memset(ev_bits, 0, sizeof(ev_bits));
-			if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0) {
-				warn("can't get event bits for %s", path);
-				close(fd);
-				continue;
-			}
-
-			if (test_bit(EV_KEY, ev_bits) && num_keyboards < MAX_INPUT_DEVICES) {
-				memset(key_bits, 0, sizeof(key_bits));
-				if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
-					warn("can't get key bits for %s", path);
-					close(fd);
-					continue;
-				}
-
-				if (test_bit(KEY_SPACE, key_bits)) {
-					DPRINTF(("found keyboard: %s\n", path));
-					keyboard_fds[num_keyboards++] = fd;
-					continue;
-				}
-			}
-
-			if ((test_bit(EV_REL, ev_bits) || test_bit(EV_ABS, ev_bits)) && num_mice < MAX_INPUT_DEVICES) {
-				memset(key_bits, 0, sizeof(key_bits));
-				if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) < 0) {
-					warn("can't get key bits for %s", path);
-					close(fd);
-					continue;
-				}
-
-				if (test_bit(BTN_MOUSE, key_bits) || test_bit(BTN_TOUCH, key_bits)) {
-					DPRINTF(("found pointer: %s\n", path));
-					mouse_fds[num_mice++] = fd;
-					continue;
-				}
-			}
-
-			close(fd);
+			snprintf(path, sizeof(path), "/dev/input/%s",
+			    entry->d_name);
+			add_device(path);
 		}
 	}
 
